@@ -1,0 +1,33 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出仓库源码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8 编译环境
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: 编译单文件免安装独立版 (内置运行时，任何Win10/11双击即用)
+        run: |
+          dotnet publish DocViewer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o ./output/Standalone
+
+      - name: 编译单文件极速轻量版 (仅3MB，适合已装.NET8的电脑)
+        run: |
+          dotnet publish DocViewer.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o ./output/Light
+
+      - name: 打包上传可执行文件供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocViewer-Windows-EXE
+          path: ./output/
