@@ -1,13 +1,18 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
+using ICSharpCode.AvalonEdit;
+using ICSharpCode.AvalonEdit.Highlighting;
 using Markdig;
 using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
@@ -18,25 +23,36 @@ namespace DocViewer
     public class MainWindow : Window
     {
         private readonly WebView2 _webView;
+        private readonly TextEditor _editor;
         private readonly TextBlock _statusText;
+        private readonly ColumnDefinition _editorColumn;
+        private readonly ColumnDefinition _splitterColumn;
+        private readonly GridSplitter _splitter;
+        private readonly Button _btnEditToggle;
+        private readonly DispatcherTimer _debounceTimer;
+
         private string _currentFilePath = string.Empty;
         private string _currentHtml = string.Empty;
         private bool _isMarkdown = false;
+        private bool _isEditMode = false;
+        private bool _isDirty = false;
+        private bool _suppressTextChanged = false;
+        private bool _markdownShellLoaded = false;
 
         [DllImport("shell32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern void SHChangeNotify(uint wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
 
         public MainWindow(string initialFilePath)
         {
-            Title = "轻阅 - PDF & Markdown 查看器";
-            Width = 1150;
-            Height = 820;
+            Title = "轻阅 - PDF & Markdown 查看/编辑器";
+            Width = 1280;
+            Height = 850;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             AllowDrop = true;
 
             var mainLayout = new DockPanel();
 
-            // 顶部工具栏
+            // 1. 顶部工具栏
             var toolbarBorder = new Border
             {
                 Background = new SolidColorBrush(Color.FromRgb(243, 244, 246)),
@@ -49,12 +65,18 @@ namespace DocViewer
             var buttonStack = new StackPanel { Orientation = Orientation.Horizontal };
 
             var btnOpen = CreateToolButton("📂 打开 (Ctrl+O)", async (s, e) => await OpenFileDialogAsync());
-            var btnSave = CreateToolButton("💾 另存 / 导出PDF (Ctrl+S)", async (s, e) => await SaveOrExportAsync());
+            var btnNewMd = CreateToolButton("📄 新建 MD (Ctrl+N)", async (s, e) => await CreateNewMarkdownAsync());
+            _btnEditToggle = CreateToolButton("✏️ 编辑模式 (Ctrl+E)", (s, e) => ToggleEditMode());
+            var btnSave = CreateToolButton("💾 保存 (Ctrl+S)", async (s, e) => await SaveDocumentAsync());
+            var btnExport = CreateToolButton("📤 导出 PDF/HTML", async (s, e) => await ExportDocumentAsync());
             var btnPrint = CreateToolButton("🖨️ 打印预览 (Ctrl+P)", async (s, e) => await ShowPrintPreviewAsync());
-            var btnAssoc = CreateToolButton("🔗 关联文件类型", (s, e) => AssociateFileTypes());
+            var btnAssoc = CreateToolButton("🔗 关联文件", (s, e) => AssociateFileTypes());
 
             buttonStack.Children.Add(btnOpen);
+            buttonStack.Children.Add(btnNewMd);
+            buttonStack.Children.Add(_btnEditToggle);
             buttonStack.Children.Add(btnSave);
+            buttonStack.Children.Add(btnExport);
             buttonStack.Children.Add(btnPrint);
             buttonStack.Children.Add(btnAssoc);
 
@@ -72,17 +94,74 @@ namespace DocViewer
             toolbarPanel.Children.Add(_statusText);
             toolbarBorder.Child = toolbarPanel;
 
-            // WebView2 核心渲染区
+            // 2. 主体双栏区域（左侧 AvalonEdit 代码编辑器 + 中间分隔条 + 右侧 WebView2 预览）
+            var contentGrid = new Grid();
+            _editorColumn = new ColumnDefinition { Width = new GridLength(0) };
+            _splitterColumn = new ColumnDefinition { Width = new GridLength(0) };
+            var previewColumn = new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) };
+
+            contentGrid.ColumnDefinitions.Add(_editorColumn);
+            contentGrid.ColumnDefinitions.Add(_splitterColumn);
+            contentGrid.ColumnDefinitions.Add(previewColumn);
+
+            // 配置带行号与语法高亮的 AvalonEdit 编辑器
+            _editor = new TextEditor
+            {
+                ShowLineNumbers = true,
+                WordWrap = true,
+                FontFamily = new FontFamily("Consolas, Microsoft YaHei UI"),
+                FontSize = 14,
+                Padding = new Thickness(8),
+                Background = new SolidColorBrush(Color.FromRgb(250, 250, 250)),
+                Foreground = new SolidColorBrush(Color.FromRgb(36, 41, 47)),
+                LineNumbersForeground = new SolidColorBrush(Color.FromRgb(140, 149, 159)),
+                SyntaxHighlighting = HighlightingManager.Instance.GetDefinition("MarkDown")
+                                     ?? HighlightingManager.Instance.GetDefinitionByExtension(".md"),
+                Visibility = Visibility.Collapsed
+            };
+            _editor.Options.ConvertTabsToSpaces = true;
+            _editor.Options.IndentationSize = 4;
+            _editor.Options.EnableHyperlinks = false;
+            _editor.TextChanged += OnEditorTextChanged;
+
+            _splitter = new GridSplitter
+            {
+                Width = 5,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                VerticalAlignment = VerticalAlignment.Stretch,
+                Background = new SolidColorBrush(Color.FromRgb(209, 213, 219)),
+                ShowsPreview = true,
+                Visibility = Visibility.Collapsed
+            };
+
             _webView = new WebView2();
+
+            Grid.SetColumn(_editor, 0);
+            Grid.SetColumn(_splitter, 1);
+            Grid.SetColumn(_webView, 2);
+
+            contentGrid.Children.Add(_editor);
+            contentGrid.Children.Add(_splitter);
+            contentGrid.Children.Add(_webView);
 
             DockPanel.SetDock(toolbarBorder, Dock.Top);
             mainLayout.Children.Add(toolbarBorder);
-            mainLayout.Children.Add(_webView);
+            mainLayout.Children.Add(contentGrid);
             Content = mainLayout;
 
-            // 事件绑定
+            // 3. 实时预览防抖定时器（打字停顿 220ms 后静默刷新右侧 DOM）
+            _debounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
+            _debounceTimer.Tick += async (s, e) =>
+            {
+                _debounceTimer.Stop();
+                await UpdateLivePreviewAsync();
+            };
+
+            // 4. 事件绑定
             Loaded += async (s, e) => await InitializeViewerAsync(initialFilePath);
             PreviewKeyDown += OnWindowPreviewKeyDown;
+            Closing += OnWindowClosing;
+
             PreviewDragOver += (s, e) =>
             {
                 if (e.Data.GetDataPresent(DataFormats.FileDrop))
@@ -95,7 +174,10 @@ namespace DocViewer
             {
                 if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
                 {
-                    await LoadDocumentAsync(files[0]);
+                    if (ConfirmDiscardChanges())
+                    {
+                        await LoadDocumentAsync(files[0]);
+                    }
                 }
             };
         }
@@ -105,8 +187,8 @@ namespace DocViewer
             var btn = new Button
             {
                 Content = text,
-                Padding = new Thickness(12, 5, 12, 5),
-                Margin = new Thickness(0, 0, 8, 0),
+                Padding = new Thickness(10, 5, 10, 5),
+                Margin = new Thickness(0, 0, 6, 0),
                 Background = Brushes.White,
                 BorderBrush = new SolidColorBrush(Color.FromRgb(209, 213, 219)),
                 Cursor = Cursors.Hand
@@ -124,10 +206,20 @@ namespace DocViewer
                     e.Handled = true;
                     await OpenFileDialogAsync();
                 }
+                else if (e.Key == Key.N)
+                {
+                    e.Handled = true;
+                    await CreateNewMarkdownAsync();
+                }
+                else if (e.Key == Key.E)
+                {
+                    e.Handled = true;
+                    ToggleEditMode();
+                }
                 else if (e.Key == Key.S)
                 {
                     e.Handled = true;
-                    await SaveOrExportAsync();
+                    await SaveDocumentAsync();
                 }
                 else if (e.Key == Key.P)
                 {
@@ -135,6 +227,32 @@ namespace DocViewer
                     await ShowPrintPreviewAsync();
                 }
             }
+        }
+
+        private void OnWindowClosing(object sender, CancelEventArgs e)
+        {
+            if (!ConfirmDiscardChanges())
+            {
+                e.Cancel = true;
+            }
+        }
+
+        private bool ConfirmDiscardChanges()
+        {
+            if (!_isDirty) return true;
+
+            var result = MessageBox.Show(
+                "当前 Markdown 文档有尚未保存的修改，是否在继续前保存？",
+                "未保存提醒",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Question);
+
+            if (result == MessageBoxResult.Cancel) return false;
+            if (result == MessageBoxResult.Yes)
+            {
+                return SaveMarkdownToFileSync();
+            }
+            return true;
         }
 
         private async Task InitializeViewerAsync(string initialFilePath)
@@ -158,13 +276,15 @@ namespace DocViewer
             }
             catch (Exception ex)
             {
-                MessageBox.Show("初始化 WebView2 渲染引擎失败，请确保系统为 Windows 10/11 且已安装 Edge WebView2 运行时。\n\n详细信息: " + ex.Message,
+                MessageBox.Show("初始化 WebView2 渲染引擎失败，请确保系统为 Windows 10/11。\n\n详细信息: " + ex.Message,
                     "运行环境提示", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
 
         private async Task OpenFileDialogAsync()
         {
+            if (!ConfirmDiscardChanges()) return;
+
             var ofd = new OpenFileDialog
             {
                 Title = "打开 PDF 或 Markdown 文档",
@@ -175,6 +295,35 @@ namespace DocViewer
             {
                 await LoadDocumentAsync(ofd.FileName);
             }
+        }
+
+        private async Task CreateNewMarkdownAsync()
+        {
+            if (!ConfirmDiscardChanges()) return;
+
+            if (_webView.CoreWebView2 == null)
+            {
+                await _webView.EnsureCoreWebView2Async();
+            }
+
+            _currentFilePath = string.Empty;
+            _isMarkdown = true;
+            _isDirty = false;
+
+            string starterMd = "# 未命名文档\n\n在此输入 **Markdown** 内容，右侧将实时渲染预览。\n\n```csharp\nConsole.WriteLine(\"Hello Markdown!\");\n```\n";
+            _suppressTextChanged = true;
+            _editor.Text = starterMd;
+            _suppressTextChanged = false;
+
+            string htmlBody = RenderMarkdownToHtmlFragment(starterMd);
+            _currentHtml = BuildMarkdownHtml("未命名.md", htmlBody);
+            _markdownShellLoaded = true;
+            _webView.CoreWebView2.NavigateToString(_currentHtml);
+
+            SetEditMode(true);
+            UpdateWindowTitle();
+            _statusText.Text = "新建 Markdown 文档 — 按 Ctrl+S 保存";
+            _editor.Focus();
         }
 
         private async Task LoadDocumentAsync(string filePath)
@@ -188,14 +337,17 @@ namespace DocViewer
 
             _currentFilePath = Path.GetFullPath(filePath);
             string ext = Path.GetExtension(_currentFilePath).ToLowerInvariant();
-            Title = Path.GetFileName(_currentFilePath) + " - 轻阅";
-            _statusText.Text = _currentFilePath;
+            _isDirty = false;
 
             if (ext == ".pdf")
             {
                 _isMarkdown = false;
+                _markdownShellLoaded = false;
                 _currentHtml = string.Empty;
+                SetEditMode(false);
                 _webView.CoreWebView2.Navigate(new Uri(_currentFilePath).AbsoluteUri);
+                UpdateWindowTitle();
+                _statusText.Text = _currentFilePath;
             }
             else if (ext == ".md" || ext == ".markdown" || ext == ".txt")
             {
@@ -205,15 +357,122 @@ namespace DocViewer
                     "local.md.assets", folder, CoreWebView2HostResourceAccessKind.Allow);
 
                 string mdText = ReadTextWithFallback(_currentFilePath);
-                var pipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().Build();
-                string htmlBody = Markdown.ToHtml(mdText, pipeline);
+                _suppressTextChanged = true;
+                _editor.Text = mdText;
+                _suppressTextChanged = false;
+
+                string htmlBody = RenderMarkdownToHtmlFragment(mdText);
                 _currentHtml = BuildMarkdownHtml(Path.GetFileName(_currentFilePath), htmlBody);
+                _markdownShellLoaded = true;
                 _webView.CoreWebView2.NavigateToString(_currentHtml);
+
+                UpdateWindowTitle();
+                _statusText.Text = _currentFilePath + " （按 Ctrl+E 可开启分屏编辑）";
             }
             else
             {
                 MessageBox.Show("暂不支持该文件格式，请选择 .pdf 或 .md 文件。", "格式提示", MessageBoxButton.OK, MessageBoxImage.Information);
             }
+        }
+
+        private void ToggleEditMode()
+        {
+            if (!_isMarkdown)
+            {
+                var res = MessageBox.Show("当前未打开 Markdown 文档（PDF 为只读格式）。\n是否立即新建一个空白 Markdown 文档并开始编辑？",
+                    "编辑模式提示", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (res == MessageBoxResult.Yes)
+                {
+                    _ = CreateNewMarkdownAsync();
+                }
+                return;
+            }
+
+            SetEditMode(!_isEditMode);
+        }
+
+        private void SetEditMode(bool enable)
+        {
+            _isEditMode = enable && _isMarkdown;
+
+            if (_isEditMode)
+            {
+                _editor.Visibility = Visibility.Visible;
+                _splitter.Visibility = Visibility.Visible;
+                _editorColumn.Width = new GridLength(1, GridUnitType.Star);
+                _splitterColumn.Width = new GridLength(5);
+                _btnEditToggle.Content = "👁️ 退出编辑 (Ctrl+E)";
+                _btnEditToggle.Background = new SolidColorBrush(Color.FromRgb(219, 234, 254));
+                _editor.Focus();
+            }
+            else
+            {
+                _editor.Visibility = Visibility.Collapsed;
+                _splitter.Visibility = Visibility.Collapsed;
+                _editorColumn.Width = new GridLength(0);
+                _splitterColumn.Width = new GridLength(0);
+                _btnEditToggle.Content = "✏️ 编辑模式 (Ctrl+E)";
+                _btnEditToggle.Background = Brushes.White;
+            }
+        }
+
+        private void OnEditorTextChanged(object sender, EventArgs e)
+        {
+            if (_suppressTextChanged || !_isMarkdown) return;
+
+            if (!_isDirty)
+            {
+                _isDirty = true;
+                UpdateWindowTitle();
+            }
+
+            _debounceTimer.Stop();
+            _debounceTimer.Start();
+        }
+
+        private async Task UpdateLivePreviewAsync()
+        {
+            if (!_isMarkdown || _webView.CoreWebView2 == null) return;
+
+            string mdText = _editor.Text;
+            string htmlBody = RenderMarkdownToHtmlFragment(mdText);
+            string docTitle = string.IsNullOrEmpty(_currentFilePath) ? "未命名.md" : Path.GetFileName(_currentFilePath);
+            _currentHtml = BuildMarkdownHtml(docTitle, htmlBody);
+
+            if (_markdownShellLoaded)
+            {
+                try
+                {
+                    // 仅替换内部 DOM 节点，保留右侧滚动条位置且不闪屏
+                    string jsonHtml = JsonSerializer.Serialize(htmlBody);
+                    await _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"var c = document.getElementById('md-root'); if(c) c.innerHTML = {jsonHtml};");
+                    return;
+                }
+                catch
+                {
+                    // 回退到完整加载
+                }
+            }
+
+            _markdownShellLoaded = true;
+            _webView.CoreWebView2.NavigateToString(_currentHtml);
+        }
+
+        private static string RenderMarkdownToHtmlFragment(string mdText)
+        {
+            var pipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().Build();
+            return Markdown.ToHtml(mdText ?? string.Empty, pipeline);
+        }
+
+        private void UpdateWindowTitle()
+        {
+            string name = string.IsNullOrEmpty(_currentFilePath)
+                ? (_isMarkdown ? "未命名.md" : "轻阅")
+                : Path.GetFileName(_currentFilePath);
+
+            string dirtyMark = _isDirty ? "* " : "";
+            Title = $"{dirtyMark}{name} - 轻阅 PDF & Markdown 查看/编辑器";
         }
 
         private static string ReadTextWithFallback(string path)
@@ -230,15 +489,14 @@ namespace DocViewer
             }
         }
 
-        private async Task SaveOrExportAsync()
+        private async Task SaveDocumentAsync()
         {
-            if (string.IsNullOrEmpty(_currentFilePath) || !File.Exists(_currentFilePath))
+            if (_isMarkdown)
             {
-                MessageBox.Show("请先打开一个 PDF 或 Markdown 文档。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
+                SaveMarkdownToFileSync();
+                await Task.CompletedTask;
             }
-
-            if (!_isMarkdown)
+            else if (!string.IsNullOrEmpty(_currentFilePath) && File.Exists(_currentFilePath))
             {
                 var sfd = new SaveFileDialog
                 {
@@ -252,48 +510,96 @@ namespace DocViewer
                     {
                         File.Copy(_currentFilePath, sfd.FileName, true);
                     }
-                    _statusText.Text = "已成功另存至: " + sfd.FileName;
+                    _statusText.Text = "已成功另存 PDF 至: " + sfd.FileName;
                 }
             }
             else
             {
+                MessageBox.Show("当前没有可保存的文档。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        private bool SaveMarkdownToFileSync()
+        {
+            if (string.IsNullOrEmpty(_currentFilePath))
+            {
                 var sfd = new SaveFileDialog
                 {
-                    Title = "导出或另存 Markdown 文档",
-                    Filter = "导出为 PDF 文档 (*.pdf)|*.pdf|导出为独立网页 (*.html)|*.html|另存为 Markdown 源文件 (*.md)|*.md",
-                    FileName = Path.GetFileNameWithoutExtension(_currentFilePath) + ".pdf"
+                    Title = "保存 Markdown 文档",
+                    Filter = "Markdown 文档 (*.md)|*.md|所有文件 (*.*)|*.*",
+                    FileName = "未命名.md"
                 };
+                if (sfd.ShowDialog() != true) return false;
+                _currentFilePath = sfd.FileName;
 
-                if (sfd.ShowDialog() == true)
+                if (_webView.CoreWebView2 != null)
                 {
-                    string targetExt = Path.GetExtension(sfd.FileName).ToLowerInvariant();
-                    if (targetExt == ".pdf")
-                    {
-                        bool ok = await _webView.CoreWebView2.PrintToPdfAsync(sfd.FileName);
-                        _statusText.Text = ok ? "已导出 PDF: " + sfd.FileName : "导出 PDF 失败";
-                    }
-                    else if (targetExt == ".html")
-                    {
-                        File.WriteAllText(sfd.FileName, _currentHtml, Encoding.UTF8);
-                        _statusText.Text = "已导出 HTML: " + sfd.FileName;
-                    }
-                    else
-                    {
-                        if (!string.Equals(_currentFilePath, sfd.FileName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            File.Copy(_currentFilePath, sfd.FileName, true);
-                        }
-                        _statusText.Text = "已另存 Markdown: " + sfd.FileName;
-                    }
+                    string folder = Path.GetDirectoryName(_currentFilePath) ?? AppContext.BaseDirectory;
+                    _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                        "local.md.assets", folder, CoreWebView2HostResourceAccessKind.Allow);
+                }
+            }
+
+            File.WriteAllText(_currentFilePath, _editor.Text, new UTF8Encoding(false));
+            _isDirty = false;
+            UpdateWindowTitle();
+            _statusText.Text = "已保存修改 (" + DateTime.Now.ToString("HH:mm:ss") + "): " + _currentFilePath;
+            return true;
+        }
+
+        private async Task ExportDocumentAsync()
+        {
+            if (!_isMarkdown && string.IsNullOrEmpty(_currentFilePath))
+            {
+                MessageBox.Show("请先打开或新建一个文档。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            if (!_isMarkdown)
+            {
+                await SaveDocumentAsync();
+                return;
+            }
+
+            string baseName = string.IsNullOrEmpty(_currentFilePath)
+                ? "未命名"
+                : Path.GetFileNameWithoutExtension(_currentFilePath);
+
+            var sfd = new SaveFileDialog
+            {
+                Title = "导出 Markdown 为 PDF 或 HTML",
+                Filter = "PDF 文档 (*.pdf)|*.pdf|独立 HTML 网页 (*.html)|*.html|另存 Markdown 副本 (*.md)|*.md",
+                FileName = baseName + ".pdf"
+            };
+
+            if (sfd.ShowDialog() == true)
+            {
+                string targetExt = Path.GetExtension(sfd.FileName).ToLowerInvariant();
+                if (targetExt == ".pdf")
+                {
+                    await UpdateLivePreviewAsync();
+                    bool ok = await _webView.CoreWebView2.PrintToPdfAsync(sfd.FileName);
+                    _statusText.Text = ok ? "已成功导出 PDF: " + sfd.FileName : "导出 PDF 失败";
+                }
+                else if (targetExt == ".html")
+                {
+                    await UpdateLivePreviewAsync();
+                    File.WriteAllText(sfd.FileName, _currentHtml, Encoding.UTF8);
+                    _statusText.Text = "已成功导出 HTML: " + sfd.FileName;
+                }
+                else
+                {
+                    File.WriteAllText(sfd.FileName, _editor.Text, new UTF8Encoding(false));
+                    _statusText.Text = "已另存 Markdown 副本: " + sfd.FileName;
                 }
             }
         }
 
         private async Task ShowPrintPreviewAsync()
         {
-            if (string.IsNullOrEmpty(_currentFilePath) || _webView.CoreWebView2 == null)
+            if ((string.IsNullOrEmpty(_currentFilePath) && !_isMarkdown) || _webView.CoreWebView2 == null)
             {
-                MessageBox.Show("请先打开一个需要打印的文档。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show("请先打开或新建一个需要打印的文档。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
@@ -373,16 +679,19 @@ namespace DocViewer
 <meta charset='utf-8'>
 <style>
   body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #F9FAFB; color: #374151; display: flex; align-items: center; justify-content: center; height: 90vh; margin: 0; }
-  .card { background: white; padding: 40px 50px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); text-align: center; max-width: 480px; }
+  .card { background: white; padding: 40px 50px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); text-align: center; max-width: 520px; }
   h2 { margin-top: 0; color: #111827; }
-  p { line-height: 1.6; color: #6B7280; }
-  .kbd { background: #F3F4F6; border: 1px solid #D1D5DB; border-radius: 4px; padding: 2px 6px; font-size: 0.9em; }
+  p { line-height: 1.7; color: #6B7280; }
+  .kbd { background: #F3F4F6; border: 1px solid #D1D5DB; border-radius: 4px; padding: 2px 6px; font-size: 0.9em; color: #111827; }
 </style>
 </head>
 <body>
   <div class='card'>
-    <h2>轻阅 PDF & Markdown 查看器</h2>
-    <p>点击顶部 <b>打开</b> 按钮（或按 <span class='kbd'>Ctrl+O</span>），也可以直接将 <b>.pdf</b> 或 <b>.md</b> 文件拖拽到此窗口中阅读。</p>
+    <h2>轻阅 PDF & Markdown 查看/编辑器</h2>
+    <p>
+      • 点击 <b>打开</b> (<span class='kbd'>Ctrl+O</span>) 或直接将 <b>.pdf / .md</b> 拖入窗口阅读<br/>
+      • 点击 <b>新建 MD</b> (<span class='kbd'>Ctrl+N</span>) 或 <b>编辑模式</b> (<span class='kbd'>Ctrl+E</span>) 开启带行号与语法高亮的双栏实时编辑
+    </p>
   </div>
 </body>
 </html>";
@@ -421,7 +730,9 @@ namespace DocViewer
 </style>
 </head>
 <body>
+<div id='md-root'>
 {htmlBody}
+</div>
 </body>
 </html>";
         }
