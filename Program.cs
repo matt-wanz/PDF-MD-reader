@@ -50,7 +50,11 @@ namespace DocViewer
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             AllowDrop = true;
 
-            var mainLayout = new DockPanel();
+            // 使用根 Grid 强制划分上下两行，防止 WebView2 向上挤压遮挡工具栏
+            // 强制锁定工具栏行高，防止 WebView2 撑破布局
+            var rootGrid = new Grid();
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46), MinHeight = 46, MaxHeight = 46 }); 
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // 1. 顶部工具栏
             var toolbarBorder = new Border
@@ -58,11 +62,19 @@ namespace DocViewer
                 Background = new SolidColorBrush(Color.FromRgb(243, 244, 246)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(209, 213, 219)),
                 BorderThickness = new Thickness(0, 0, 0, 1),
-                Padding = new Thickness(10, 6, 10, 6)
+                Padding = new Thickness(10, 0, 10, 0),
+                SnapsToDevicePixels = true
             };
 
-            var toolbarPanel = new DockPanel();
-            var buttonStack = new StackPanel { Orientation = Orientation.Horizontal };
+            var toolbarGrid = new Grid();
+            toolbarGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            toolbarGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var buttonStack = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
 
             var btnOpen = CreateToolButton("📂 打开 (Ctrl+O)", async (s, e) => await OpenFileDialogAsync());
             var btnNewMd = CreateToolButton("📄 新建 MD (Ctrl+N)", async (s, e) => await CreateNewMarkdownAsync());
@@ -85,14 +97,15 @@ namespace DocViewer
                 Text = "就绪 — 支持直接拖入 .pdf 或 .md 文件",
                 VerticalAlignment = VerticalAlignment.Center,
                 Foreground = new SolidColorBrush(Color.FromRgb(107, 114, 128)),
-                Margin = new Thickness(12, 0, 0, 0),
+                Margin = new Thickness(10, 0, 0, 0),
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
 
-            DockPanel.SetDock(buttonStack, Dock.Left);
-            toolbarPanel.Children.Add(buttonStack);
-            toolbarPanel.Children.Add(_statusText);
-            toolbarBorder.Child = toolbarPanel;
+            Grid.SetColumn(buttonStack, 0);
+            Grid.SetColumn(_statusText, 1);
+            toolbarGrid.Children.Add(buttonStack);
+            toolbarGrid.Children.Add(_statusText);
+            toolbarBorder.Child = toolbarGrid;
 
             // 2. 主体双栏区域（左侧 AvalonEdit 代码编辑器 + 中间分隔条 + 右侧 WebView2 预览）
             var contentGrid = new Grid();
@@ -104,7 +117,6 @@ namespace DocViewer
             contentGrid.ColumnDefinitions.Add(_splitterColumn);
             contentGrid.ColumnDefinitions.Add(previewColumn);
 
-            // 配置带行号与语法高亮的 AvalonEdit 编辑器
             _editor = new TextEditor
             {
                 ShowLineNumbers = true,
@@ -144,12 +156,13 @@ namespace DocViewer
             contentGrid.Children.Add(_splitter);
             contentGrid.Children.Add(_webView);
 
-            DockPanel.SetDock(toolbarBorder, Dock.Top);
-            mainLayout.Children.Add(toolbarBorder);
-            mainLayout.Children.Add(contentGrid);
-            Content = mainLayout;
+            Grid.SetRow(toolbarBorder, 0);
+            Grid.SetRow(contentGrid, 1);
+            rootGrid.Children.Add(toolbarBorder);
+            rootGrid.Children.Add(contentGrid);
+            Content = rootGrid;
 
-            // 3. 实时预览防抖定时器（打字停顿 220ms 后静默刷新右侧 DOM）
+            // 3. 实时预览防抖定时器
             _debounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
             _debounceTimer.Tick += async (s, e) =>
             {
@@ -187,8 +200,10 @@ namespace DocViewer
             var btn = new Button
             {
                 Content = text,
-                Padding = new Thickness(10, 5, 10, 5),
+                Height = 30,
+                Padding = new Thickness(10, 0, 10, 0),
                 Margin = new Thickness(0, 0, 6, 0),
+                VerticalContentAlignment = VerticalAlignment.Center,
                 Background = Brushes.White,
                 BorderBrush = new SolidColorBrush(Color.FromRgb(209, 213, 219)),
                 Cursor = Cursors.Hand
@@ -201,32 +216,41 @@ namespace DocViewer
         {
             if (Keyboard.Modifiers == ModifierKeys.Control)
             {
-                if (e.Key == Key.O)
+                if (await HandleShortcutKeyAsync(e.Key))
                 {
                     e.Handled = true;
-                    await OpenFileDialogAsync();
-                }
-                else if (e.Key == Key.N)
-                {
-                    e.Handled = true;
-                    await CreateNewMarkdownAsync();
-                }
-                else if (e.Key == Key.E)
-                {
-                    e.Handled = true;
-                    ToggleEditMode();
-                }
-                else if (e.Key == Key.S)
-                {
-                    e.Handled = true;
-                    await SaveDocumentAsync();
-                }
-                else if (e.Key == Key.P)
-                {
-                    e.Handled = true;
-                    await ShowPrintPreviewAsync();
                 }
             }
+        }
+
+        private async Task<bool> HandleShortcutKeyAsync(Key key)
+        {
+            if (key == Key.O)
+            {
+                await OpenFileDialogAsync();
+                return true;
+            }
+            if (key == Key.N)
+            {
+                await CreateNewMarkdownAsync();
+                return true;
+            }
+            if (key == Key.E)
+            {
+                ToggleEditMode();
+                return true;
+            }
+            if (key == Key.S)
+            {
+                await SaveDocumentAsync();
+                return true;
+            }
+            if (key == Key.P)
+            {
+                await ShowPrintPreviewAsync();
+                return true;
+            }
+            return false;
         }
 
         private void OnWindowClosing(object sender, CancelEventArgs e)
@@ -264,6 +288,19 @@ namespace DocViewer
                     "DocViewer_WebView2");
                 var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
                 await _webView.EnsureCoreWebView2Async(env);
+
+                // 防止 WebView2 内部吞掉 Ctrl+E / Ctrl+O / Ctrl+S 等全局快捷键
+                _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
+                _webView.PreviewKeyDown += async (s, e) =>
+                {
+                    if (Keyboard.Modifiers == ModifierKeys.Control)
+                    {
+                        if (await HandleShortcutKeyAsync(e.Key))
+                        {
+                            e.Handled = true;
+                        }
+                    }
+                };
 
                 if (!string.IsNullOrWhiteSpace(initialFilePath) && File.Exists(initialFilePath))
                 {
@@ -367,7 +404,7 @@ namespace DocViewer
                 _webView.CoreWebView2.NavigateToString(_currentHtml);
 
                 UpdateWindowTitle();
-                _statusText.Text = _currentFilePath + " （按 Ctrl+E 可开启分屏编辑）";
+                _statusText.Text = _currentFilePath + " （点击顶部【编辑模式】或按 Ctrl+E 开启分屏编辑）";
             }
             else
             {
@@ -443,7 +480,6 @@ namespace DocViewer
             {
                 try
                 {
-                    // 仅替换内部 DOM 节点，保留右侧滚动条位置且不闪屏
                     string jsonHtml = JsonSerializer.Serialize(htmlBody);
                     await _webView.CoreWebView2.ExecuteScriptAsync(
                         $"var c = document.getElementById('md-root'); if(c) c.innerHTML = {jsonHtml};");
@@ -451,7 +487,6 @@ namespace DocViewer
                 }
                 catch
                 {
-                    // 回退到完整加载
                 }
             }
 
@@ -689,7 +724,7 @@ namespace DocViewer
   <div class='card'>
     <h2>轻阅 PDF & Markdown 查看/编辑器</h2>
     <p>
-      • 点击 <b>打开</b> (<span class='kbd'>Ctrl+O</span>) 或直接将 <b>.pdf / .md</b> 拖入窗口阅读<br/>
+      • 点击顶部 <b>打开</b> (<span class='kbd'>Ctrl+O</span>) 或直接将 <b>.pdf / .md</b> 拖入窗口阅读<br/>
       • 点击 <b>新建 MD</b> (<span class='kbd'>Ctrl+N</span>) 或 <b>编辑模式</b> (<span class='kbd'>Ctrl+E</span>) 开启带行号与语法高亮的双栏实时编辑
     </p>
   </div>
