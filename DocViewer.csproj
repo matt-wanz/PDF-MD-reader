@@ -8,7 +8,6 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DocViewer</AssemblyName>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
   <ItemGroup>
