@@ -1,9 +1,12 @@
-name: Build Windows EXE
+name: Build and Release Windows EXE
 
 on:
   push:
     branches: [ "*" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -18,16 +21,22 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: 编译单文件免安装独立版 (内置运行时，任何Win10/11双击即用)
-        run: |
-          dotnet publish DocViewer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o ./output/Standalone
-
-      - name: 编译单文件极速轻量版 (仅3MB，适合已装.NET8的电脑)
+      - name: 编译极速轻量版 (约3MB，推荐日常使用)
         run: |
           dotnet publish DocViewer.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o ./output/Light
+          Move-Item ./output/Light/DocViewer.exe ./output/DocViewer-Light.exe
 
-      - name: 打包上传可执行文件供下载
-        uses: actions/upload-artifact@v4
+      - name: 编译免安装独立版 (内置运行时并开启压缩，约55MB)
+        run: |
+          dotnet publish DocViewer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o ./output/Standalone
+          Move-Item ./output/Standalone/DocViewer.exe ./output/DocViewer-Standalone.exe
+
+      - name: 发布成品到 GitHub Releases 页面
+        uses: softprops/action-gh-release@v2
         with:
-          name: DocViewer-Windows-EXE
-          path: ./output/
+          tag_name: v1.0.${{ github.run_number }}
+          name: 轻阅 PDF & Markdown 阅读/编辑器 v1.0.${{ github.run_number }}
+          make_latest: true
+          files: |
+            ./output/DocViewer-Light.exe
+            ./output/DocViewer-Standalone.exe
