@@ -16,68 +16,58 @@ jobs:
       - name: 检出仓库源码
         uses: actions/checkout@v4
 
-      - name: 自动识别仓库图片并生成多分辨率图标 (app.ico)
+      - name: 自动生成多分辨率 Windows 应用图标 (app.ico)
         shell: powershell
         run: |
-          Add-Type -AssemblyName PresentationCore, WindowsBase
-          $srcFile = Get-ChildItem -Path . -File | Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp)$' } | Select-Object -First 1
-          if (-not $srcFile) {
-            Write-Error "仓库根目录未找到任何图片文件（.png/.jpg/.webp），请先将图标图片上传到仓库根目录！"
-            exit 1
-          }
-          Write-Host "已找到图标源文件: $($srcFile.Name)"
+          Add-Type -AssemblyName System.Drawing
+          $srcFile = Get-ChildItem -Path . -File | Where-Object { $_.Name -match '^icon\.(png|jpg|jpeg)$' } | Select-Object -First 1
+          if ($srcFile) {
+            $srcImg = [System.Drawing.Image]::FromFile($srcFile.FullName)
+            $sizes = @(256, 64, 48, 32, 16)
+            $pngStreams = @()
+            foreach ($sz in $sizes) {
+              $bmp = New-Object System.Drawing.Bitmap($sz, $sz)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+              $g.DrawImage($srcImg, 0, 0, $sz, $sz)
+              $g.Dispose()
+              $ms = New-Object System.IO.MemoryStream
+              $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+              $pngStreams += ,$ms.ToArray()
+              $bmp.Dispose()
+              $ms.Dispose()
+            }
+            $srcImg.Dispose()
 
-          $uri = New-Object System.Uri($srcFile.FullName)
-          $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
-            $uri,
-            [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-            [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-          )
-          $frame = $decoder.Frames[0]
-
-          $sizes = @(256, 64, 48, 32, 16)
-          $pngStreams = @()
-          foreach ($sz in $sizes) {
-            $scaleX = $sz / [double]$frame.PixelWidth
-            $scaleY = $sz / [double]$frame.PixelHeight
-            $transform = New-Object System.Windows.Media.ScaleTransform($scaleX, $scaleY)
-            $scaled = New-Object System.Windows.Media.Imaging.TransformedBitmap($frame, $transform)
-
-            $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
-            $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($scaled))
-            $ms = New-Object System.IO.MemoryStream
-            $encoder.Save($ms)
-            $pngStreams += ,$ms.ToArray()
-            $ms.Dispose()
-          }
-
-          $fs = [System.IO.File]::Create("$PWD\app.ico")
-          $bw = New-Object System.IO.BinaryWriter($fs)
-          $bw.Write([uint16]0)
-          $bw.Write([uint16]1)
-          $bw.Write([uint16]$sizes.Count)
-
-          $offset = 6 + (16 * $sizes.Count)
-          for ($i = 0; $i -lt $sizes.Count; $i++) {
-            $sz = $sizes[$i]
-            $data = $pngStreams[$i]
-            $wByte = if ($sz -ge 256) { [byte]0 } else { [byte]$sz }
-            $bw.Write($wByte)
-            $bw.Write($wByte)
-            $bw.Write([byte]0)
-            $bw.Write([byte]0)
+            $fs = [System.IO.File]::Create("$PWD\app.ico")
+            $bw = New-Object System.IO.BinaryWriter($fs)
+            $bw.Write([uint16]0)
             $bw.Write([uint16]1)
-            $bw.Write([uint16]32)
-            $bw.Write([uint32]$data.Length)
-            $bw.Write([uint32]$offset)
-            $offset += $data.Length
+            $bw.Write([uint16]$sizes.Count)
+
+            $offset = 6 + (16 * $sizes.Count)
+            for ($i = 0; $i -lt $sizes.Count; $i++) {
+              $sz = $sizes[$i]
+              $data = $pngStreams[$i]
+              $wByte = if ($sz -ge 256) { [byte]0 } else { [byte]$sz }
+              $bw.Write($wByte)
+              $bw.Write($wByte)
+              $bw.Write([byte]0)
+              $bw.Write([byte]0)
+              $bw.Write([uint16]1)
+              $bw.Write([uint16]32)
+              $bw.Write([uint32]$data.Length)
+              $bw.Write([uint32]$offset)
+              $offset += $data.Length
+            }
+            foreach ($data in $pngStreams) {
+              $bw.Write($data)
+            }
+            $bw.Close()
+            $fs.Close()
+            Write-Host "Successfully generated app.ico from $($srcFile.Name)"
           }
-          foreach ($data in $pngStreams) {
-            $bw.Write($data)
-          }
-          $bw.Close()
-          $fs.Close()
-          Write-Host "成功生成多尺寸 app.ico"
 
       - name: 安装 .NET 8 编译环境
         uses: actions/setup-dotnet@v4
