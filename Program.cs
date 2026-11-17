@@ -9,7 +9,9 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using ICSharpCode.AvalonEdit;
 using ICSharpCode.AvalonEdit.Highlighting;
@@ -42,18 +44,29 @@ namespace DocViewer
         [DllImport("shell32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern void SHChangeNotify(uint wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
 
+        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+        private static extern uint ExtractIconEx(string lpszFile, int nIconIndex, IntPtr[] phiconLarge, IntPtr[] phiconSmall, uint nIcons);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
         public MainWindow(string initialFilePath)
         {
             Title = "轻阅 - PDF & Markdown 查看/编辑器";
-            Width = 1280;
-            Height = 850;
+
+            // 根据当前屏幕实际工作区（扣除任务栏和DPI缩放）自适应设置窗口大小，防止顶部被挤出屏幕
+            double workWidth = SystemParameters.WorkArea.Width;
+            double workHeight = SystemParameters.WorkArea.Height;
+            Width = Math.Min(1200, workWidth * 0.88);
+            Height = Math.Min(760, workHeight * 0.88);
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             AllowDrop = true;
 
-            // 使用根 Grid 强制划分上下两行，防止 WebView2 向上挤压遮挡工具栏
+            LoadAppWindowIcon();
+
             // 强制锁定工具栏行高，防止 WebView2 撑破布局
             var rootGrid = new Grid();
-            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46), MinHeight = 46, MaxHeight = 46 }); 
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46), MinHeight = 46, MaxHeight = 46 });
             rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // 1. 顶部工具栏
@@ -105,7 +118,7 @@ namespace DocViewer
             Grid.SetColumn(_statusText, 1);
             toolbarGrid.Children.Add(buttonStack);
             toolbarGrid.Children.Add(_statusText);
-            toolbarBorder.Child = toolbarGrid;
+            toolbarBorder.Child = toolbarPanelWrapper(toolbarGrid);
 
             // 2. 主体双栏区域（左侧 AvalonEdit 代码编辑器 + 中间分隔条 + 右侧 WebView2 预览）
             var contentGrid = new Grid();
@@ -193,6 +206,29 @@ namespace DocViewer
                     }
                 }
             };
+        }
+
+        private static UIElement toolbarPanelWrapper(UIElement child) => child;
+
+        private void LoadAppWindowIcon()
+        {
+            try
+            {
+                string exePath = Environment.ProcessPath;
+                if (!string.IsNullOrEmpty(exePath))
+                {
+                    IntPtr[] largeIcons = new IntPtr[1];
+                    if (ExtractIconEx(exePath, 0, largeIcons, null, 1) > 0 && largeIcons[0] != IntPtr.Zero)
+                    {
+                        Icon = Imaging.CreateBitmapSourceFromHIcon(
+                            largeIcons[0], Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                        DestroyIcon(largeIcons[0]);
+                    }
+                }
+            }
+            catch
+            {
+            }
         }
 
         private Button CreateToolButton(string text, RoutedEventHandler onClick)
@@ -289,7 +325,6 @@ namespace DocViewer
                 var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
                 await _webView.EnsureCoreWebView2Async(env);
 
-                // 防止 WebView2 内部吞掉 Ctrl+E / Ctrl+O / Ctrl+S 等全局快捷键
                 _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 _webView.PreviewKeyDown += async (s, e) =>
                 {
