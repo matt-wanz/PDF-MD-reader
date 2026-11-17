@@ -16,6 +16,59 @@ jobs:
       - name: 检出仓库源码
         uses: actions/checkout@v4
 
+      - name: 自动生成多分辨率 Windows 应用图标 (app.ico)
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $srcFile = Get-ChildItem -Path . -File | Where-Object { $_.Name -match '^icon\.(png|jpg|jpeg)$' } | Select-Object -First 1
+          if ($srcFile) {
+            $srcImg = [System.Drawing.Image]::FromFile($srcFile.FullName)
+            $sizes = @(256, 64, 48, 32, 16)
+            $pngStreams = @()
+            foreach ($sz in $sizes) {
+              $bmp = New-Object System.Drawing.Bitmap($sz, $sz)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+              $g.DrawImage($srcImg, 0, 0, $sz, $sz)
+              $g.Dispose()
+              $ms = New-Object System.IO.MemoryStream
+              $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+              $pngStreams += ,$ms.ToArray()
+              $bmp.Dispose()
+              $ms.Dispose()
+            }
+            $srcImg.Dispose()
+
+            $fs = [System.IO.File]::Create("$PWD\app.ico")
+            $bw = New-Object System.IO.BinaryWriter($fs)
+            $bw.Write([uint16]0)
+            $bw.Write([uint16]1)
+            $bw.Write([uint16]$sizes.Count)
+
+            $offset = 6 + (16 * $sizes.Count)
+            for ($i = 0; $i -lt $sizes.Count; $i++) {
+              $sz = $sizes[$i]
+              $data = $pngStreams[$i]
+              $wByte = if ($sz -ge 256) { [byte]0 } else { [byte]$sz }
+              $bw.Write($wByte)
+              $bw.Write($wByte)
+              $bw.Write([byte]0)
+              $bw.Write([byte]0)
+              $bw.Write([uint16]1)
+              $bw.Write([uint16]32)
+              $bw.Write([uint32]$data.Length)
+              $bw.Write([uint32]$offset)
+              $offset += $data.Length
+            }
+            foreach ($data in $pngStreams) {
+              $bw.Write($data)
+            }
+            $bw.Close()
+            $fs.Close()
+            Write-Host "Successfully generated app.ico from $($srcFile.Name)"
+          }
+
       - name: 安装 .NET 8 编译环境
         uses: actions/setup-dotnet@v4
         with:
